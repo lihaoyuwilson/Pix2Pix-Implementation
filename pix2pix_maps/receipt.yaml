@@ -22,6 +22,7 @@ batch_size: 16                     # tune based on GPU memory
 num_workers: 4
 
 # ----------------- Model -----------------
+conditional: True                 # Set False for Unconditional GAN
 ngf: 64                            # pix2pix: generator base channels (U-Net)
 ndf: 64                            # pix2pix: discriminator base channels (PatchGAN)
 n_layers_D: 3                      # pix2pix: 70×70 PatchGAN receptive field

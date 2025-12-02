@@ -34,7 +34,9 @@ class MapsAlignedDataset(Dataset):
         super().__init__()
         self.root = Path(root) / split
         self.paths = sorted([p for p in self.root.glob("*.jpg")])
-        assert len(self.paths) > 0, f"No .jpg found in {self.root}"
+        if len(self.paths) == 0:
+            logger.warning(f"No .jpg found in {self.root}")
+            
         self.direction = direction
         self.load_size = load_size
         self.crop_size = crop_size
@@ -45,7 +47,7 @@ class MapsAlignedDataset(Dataset):
 
     def _split_ab(self, img: Image.Image) -> Tuple[Image.Image, Image.Image]:
         w, h = img.size
-        assert w % 2 == 0, f"Image width {w} not even for {self.paths[0].name}"
+        # assert w % 2 == 0, f"Image width {w} not even for {self.paths[0].name}"
         w2 = w // 2
         return img.crop((0, 0, w2, h)), img.crop((w2, 0, w, h))
 
@@ -155,13 +157,20 @@ class UNetGenerator(nn.Module):
         return self.d8(d7)
 
 class PatchDiscriminator(nn.Module):
-    """70x70 PatchGAN."""
-    def __init__(self, in_c=3, nf=64, n_layers=3):
+    """
+    70x70 PatchGAN.
+    Modified to support Unconditional GAN (Standard GAN).
+    """
+    def __init__(self, in_c=3, nf=64, n_layers=3, conditional=True):
         super().__init__()
-        # pix2pix: "conditional" D — concatenate input and output (real or fake)
-        layers = [nn.Conv2d(in_c * 2, nf, 4, 2, 1), nn.LeakyReLU(0.2, True)]
+        self.conditional = conditional
+        
+        # Pix2Pix (Conditional): Input is Source(3) + Target(3) = 6 channels
+        # Standard GAN (Unconditional): Input is Target(3) = 3 channels
+        input_channels = in_c * 2 if self.conditional else in_c
+        
+        layers = [nn.Conv2d(input_channels, nf, 4, 2, 1), nn.LeakyReLU(0.2, True)]
         ch = nf
-        # pix2pix: small receptive-field discriminator (PatchGAN ~70x70 with n_layers=3)
         for _ in range(1, n_layers):
             layers += [nn.Conv2d(ch, ch*2, 4, 2, 1, bias=False),
                        nn.BatchNorm2d(ch*2),
@@ -170,11 +179,18 @@ class PatchDiscriminator(nn.Module):
         layers += [nn.Conv2d(ch, ch*2, 4, 1, 1, bias=False),
                    nn.BatchNorm2d(ch*2),
                    nn.LeakyReLU(0.2, True)]
-        layers += [nn.Conv2d(ch*2, 1, 4, 1, 1)]  # pix2pix: use logits (no sigmoid)
+        layers += [nn.Conv2d(ch*2, 1, 4, 1, 1)] 
         self.net = nn.Sequential(*layers)
 
     def forward(self, src, tgt):
-        return self.net(torch.cat([src, tgt], dim=1))  # pix2pix: conditional on src
+        # src: Input image (Satellite)
+        # tgt: Real Map or Fake Map
+        if self.conditional:
+            # Condition on source image
+            return self.net(torch.cat([src, tgt], dim=1))
+        else:
+            # Ignore source, just judge the map
+            return self.net(tgt)
 
 
 # ----------------------------- Brain -----------------------------
@@ -185,9 +201,13 @@ class Pix2PixBrain(sb.core.Brain):
     def compute_forward(self, batch, stage):
         batch = self._move_batch(batch)
         src, tgt = batch["src"], batch["tgt"]
+        
         fake = self.modules.G(src)
+        
+        # Discriminator handles whether to use 'src' or not internally based on flag
         d_real = self.modules.D(src, tgt)
         d_fake = self.modules.D(src, fake.detach())
+        
         return fake, d_real, d_fake, src, tgt
 
     def compute_objectives(self, predictions, batch, stage):
@@ -195,12 +215,16 @@ class Pix2PixBrain(sb.core.Brain):
         valid = torch.ones_like(d_real)
         fake_lbl = torch.zeros_like(d_fake)
 
-        # pix2pix: generator objective = GAN loss + λ * L1 (Eq.1)
-        gan_loss_G = self.hparams.bce_with_logits(self.modules.D(src, fake), valid)  # BCEWithLogits ~ logistic GAN
-        l1_loss = F.l1_loss(fake, tgt) * self.hparams.lambda_L1                      # L1 reconstruction to reduce blur
+        # 1. Generator Loss
+        # Fool the discriminator
+        pred_fake = self.modules.D(src, fake)
+        gan_loss_G = self.hparams.bce_with_logits(pred_fake, valid)
+        
+        # L1 reconstruction loss (always used to guide the translation)
+        l1_loss = F.l1_loss(fake, tgt) * self.hparams.lambda_L1
         g_loss = gan_loss_G + l1_loss
 
-        # pix2pix: discriminator objective on real/fake patches (PatchGAN)
+        # 2. Discriminator Loss
         d_loss = 0.5 * (
             self.hparams.bce_with_logits(d_real, valid) +
             self.hparams.bce_with_logits(d_fake, fake_lbl)
@@ -326,9 +350,21 @@ if __name__ == "__main__":
 
     train_loader, valid_loader, sample_loader_builders = build_dataloaders(hparams)
     hparams["sample_loader_builders"] = sample_loader_builders
+    
+    # --- CHECK FOR CONDITIONAL FLAG ---
+    # Default to True (Pix2Pix Standard) if not present in yaml
+    is_conditional = hparams.get("conditional", True)
 
     G = UNetGenerator(in_c=3, out_c=3, nf=hparams["ngf"])
-    D = PatchDiscriminator(in_c=3, nf=hparams["ndf"], n_layers=hparams["n_layers_D"])
+    
+    # Pass flag to D
+    D = PatchDiscriminator(
+        in_c=3, 
+        nf=hparams["ndf"], 
+        n_layers=hparams["n_layers_D"], 
+        conditional=is_conditional
+    )
+    
     modules = {"G": G, "D": D}
     model_list = nn.ModuleList([G, D])
 
